@@ -1,5 +1,7 @@
 ## Text Semantic Search Plugin
 
+![Screencastfrom2025-10-2310-50-58-ezgif com-video-to-webp-converter](https://github.com/user-attachments/assets/364a7442-70e4-4eae-b179-323344200e91)
+
 
 This plugin is a Python plugin that allows you to search through your dataset using semantic similarity on text fields instead of exact keyword matching.
 
