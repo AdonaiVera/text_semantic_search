@@ -1,6 +1,6 @@
 ## Text Semantic Search Plugin
+![demo](https://github.com/user-attachments/assets/124330f9-b564-4aae-9fe8-67a5ca0606a4)
 
-![Screencastfrom2025-10-2310-50-58-ezgif com-video-to-webp-converter](https://github.com/user-attachments/assets/364a7442-70e4-4eae-b179-323344200e91)
 
 This plugin enables semantic search through your FiftyOne datasets by generating text embeddings and creating similarity indices. It supports both regular text fields and detection label fields, allowing you to search for samples based on semantic meaning rather than exact keyword matching.
 
