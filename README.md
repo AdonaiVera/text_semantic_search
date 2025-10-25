@@ -72,7 +72,6 @@ You can then search semantically for:
 
 - ✅ **Detection Field Support**: Automatically extracts labels from detection objects
 - ✅ **Multiple Field Types**: Handles strings, detections, and nested fields
-- ✅ **Smart Caching**: Reuses existing embeddings and similarity indices
 - ✅ **Frame Sampling**: Process subsets of large datasets efficiently
 - ✅ **CLIP Integration**: Uses state-of-the-art vision-language models
 - ✅ **FiftyOne Integration**: Seamless integration with FiftyOne's search interface
