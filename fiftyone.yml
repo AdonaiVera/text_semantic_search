@@ -2,7 +2,7 @@ fiftyone:
   version: ">=1.3.0"
 name: "@adonaivera/text_semantic_search"
 version: "1.0.1"
-description: "Perform semantic search on text fields using embeddings"
+description: "Compute text embeddings and similarity for text fields"
 url: "https://github.com/AdonaiVera/text_semantic_search/blob/main/README.md"
 operators:
-  - text_semantic_search
+  - compute_text_embeddings

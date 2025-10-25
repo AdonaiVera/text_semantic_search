@@ -5,39 +5,13 @@
 ||
 """
 
-import os
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import pickle
 
 import fiftyone as fo
-from fiftyone.core.utils import add_sys_path
+import fiftyone.brain as fob
 import fiftyone.operators as foo
 from fiftyone.operators import types
-from fiftyone import ViewField as F
-
-# Initialize NLTK WordNet data
-try:
-    import nltk
-    nltk.download('wordnet', quiet=True)
-    from nltk.corpus import wordnet
-    WORDNET_AVAILABLE = True
-except:
-    WORDNET_AVAILABLE = False
-
-
-def _is_teams_deployment():
-    val = os.environ.get("FIFTYONE_INTERNAL_SERVICE", "")
-    return val.lower() in ("true", "1")
-
-
-TEAMS_DEPLOYMENT = _is_teams_deployment()
-
-
-if not TEAMS_DEPLOYMENT:
-    with add_sys_path(os.path.dirname(os.path.abspath(__file__))):
-        from cache_manager import get_cache
 
 
 def get_text_fields(dataset):
@@ -48,173 +22,130 @@ def get_text_fields(dataset):
         full_type = str(ftype)
         if "StringField" in full_type:
             text_fields.append(field)
+        elif "DetectionField" in full_type or "DetectionsField" in full_type:
+            text_fields.append(field)
     return text_fields
 
 
-def get_embedding_model():
-    """Get or initialize the embedding model."""
-    return SentenceTransformer('all-MiniLM-L6-v2')
+def get_fiftyone_model_name(sentence_transformers_name):
+    """Map sentence-transformers model names to FiftyOne model names."""
+    mapping = {
+        'clip-ViT-B-32': 'clip-vit-base32-torch'
+    }
+    return mapping.get(sentence_transformers_name, sentence_transformers_name)
 
-
-def get_synonyms(word):
-    """Get synonyms using pre-loaded NLTK WordNet."""
-    if WORDNET_AVAILABLE:
-        synonyms = set()
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                synonyms.add(lemma.name().replace('_', ' ').lower())
-        return list(synonyms)
-    else:
-        # Fallback to simple synonyms if NLTK not available
-        fallback_synonyms = {
-            'car': ['car', 'vehicle', 'auto', 'automobile'],
-            'night': ['night', 'dark', 'evening'],
-            'day': ['day', 'daytime', 'bright', 'sunny'],
-            'building': ['building', 'house', 'structure'],
-            'person': ['person', 'people', 'pedestrian']
-        }
-        return fallback_synonyms.get(word.lower(), [word])
-
-
-def simple_keyword_match(text, query):
-    """Enhanced keyword matching with WordNet synonyms."""
-    text_lower = text.lower()
-    query_lower = query.lower()
+def compute_embeddings(dataset, fields, model_name, batch_size, embedding_field_name=None, frame_skip=1):
+    """Compute embeddings for selected text fields with frame sampling."""
+    if embedding_field_name is None:
+        fields_suffix = '_'.join(fields)
+        model_suffix = model_name.replace('-', '_').replace('/', '_')
+        embedding_field_name = f"embeddings_{fields_suffix}_{model_suffix}"
     
-    # Check direct match first
-    if query_lower in text_lower:
-        return 1.0
+    if embedding_field_name in dataset.get_field_schema(flat=True):
+        print(f"Using existing embeddings: {embedding_field_name}")
+        return embedding_field_name
     
-    # Get synonyms for each word in query
-    query_words = query_lower.split()
-    all_synonyms = set(query_words)
-    
-    for word in query_words:
-        synonyms = get_synonyms(word)
-        all_synonyms.update(synonyms)
-    
-    # Check if any synonym appears in text
-    for synonym in all_synonyms:
-        if synonym in text_lower:
-            return 0.8
-    
-    return 0.0
-
-
-def get_or_create_embeddings(dataset, fields, model, batch_size=32):
-    """Get existing embeddings or create new ones for samples."""
-    embedding_field = f"embeddings_{'_'.join(fields)}"
-    
-    if embedding_field not in dataset.get_field_schema(flat=True):
-        print(f"Creating embedding field: {embedding_field}")
-        dataset.add_sample_field(embedding_field, fo.VectorField)
+    print(f"Creating embedding field: {embedding_field_name}")
+    dataset.add_sample_field(embedding_field_name, fo.VectorField)
     
     samples_to_process = []
-    existing_embeddings = {}
+    total_samples = len(dataset)
+    processed_count = 0
+    skipped_count = 0
     
-    for sample in dataset:
-        if embedding_field in sample and sample[embedding_field] is not None:
-            existing_embeddings[sample.id] = sample[embedding_field]
-        else:
+    for i, sample in enumerate(dataset):
+        if i % frame_skip == 0:
             text_content = []
             for field in fields:
-                if field in sample and sample[field] is not None:
-                    text_content.append(str(sample[field]))
+                if '.' in field and field.endswith('.label'):
+                    parent_field = field.split('.')[0]
+                    if parent_field in sample and sample[parent_field] is not None:
+                        parent_obj = sample[parent_field]
+                        if hasattr(parent_obj, 'detections') and parent_obj.detections:
+                            labels = []
+                            for detection in parent_obj.detections:
+                                if hasattr(detection, 'label') and detection.label:
+                                    labels.append(detection.label)
+                            if labels:
+                                text_content.append(" ".join(labels))
+                elif field in sample and sample[field] is not None:
+                    field_value = sample[field]
+                    if hasattr(field_value, 'label') and field_value.label:
+                        text_content.append(field_value.label)
+                    elif hasattr(field_value, '__iter__') and not isinstance(field_value, str):
+                        for detection in field_value:
+                            if hasattr(detection, 'label') and detection.label:
+                                text_content.append(detection.label)
+                    else:
+                        text_content.append(str(field_value))
             
             if text_content:
                 samples_to_process.append((sample.id, " ".join(text_content)))
+                processed_count += 1
+        else:
+            skipped_count += 1
+    
+    print(f"Frame sampling: Processing {processed_count} samples, skipping {skipped_count} samples (every {frame_skip} frame(s))")
     
     if samples_to_process:
-        print(f"Generating embeddings for {len(samples_to_process)} samples...")
+        print(f"Computing embeddings for {len(samples_to_process)} samples using model: {model_name}")
+        model = SentenceTransformer(model_name)
         sample_ids, sample_texts = zip(*samples_to_process)
-        new_embeddings = []
         
-        for i in range(0, len(sample_texts), batch_size):
-            batch_texts = sample_texts[i:i + batch_size]
-            batch_embeddings = model.encode(
-                batch_texts, 
-                batch_size=batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True
-            )
-            new_embeddings.extend(batch_embeddings)
+        embeddings = model.encode(
+            sample_texts, 
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
         
-        new_embeddings = np.array(new_embeddings)
-        
-        for sample_id, embedding in zip(sample_ids, new_embeddings):
+        for sample_id, embedding in zip(sample_ids, embeddings):
             sample = dataset[sample_id]
-            sample[embedding_field] = embedding
+            sample[embedding_field_name] = embedding
             sample.save()
-            existing_embeddings[sample_id] = embedding
-    
-    return existing_embeddings, embedding_field
-
-
-def semantic_search(dataset, fields, query_text, threshold=0.3, top_k=100, batch_size=32):
-    """Perform hybrid semantic search using embeddings + keyword matching."""
-    model = get_embedding_model()
-    
-    sample_embeddings, embedding_field = get_or_create_embeddings(dataset, fields, model, batch_size)
-    
-    if not sample_embeddings:
-        return dataset.limit(0)
-    
-    query_embedding = model.encode(
-        [query_text],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False
-    )[0]
-    
-    sample_ids = list(sample_embeddings.keys())
-    embeddings_matrix = np.array([sample_embeddings[sid] for sid in sample_ids])
-    embedding_similarities = np.dot(embeddings_matrix, query_embedding)
-    
-    # Add keyword matching scores
-    combined_scores = []
-    for i, sample_id in enumerate(sample_ids):
-        sample = dataset[sample_id]
-        text_content = []
-        for field in fields:
-            if field in sample and sample[field] is not None:
-                text_content.append(str(sample[field]))
         
-        full_text = " ".join(text_content)
-        keyword_score = simple_keyword_match(full_text, query_text)
-        
-        # Combine embedding similarity (0.7 weight) + keyword score (0.3 weight)
-        combined_score = 0.7 * embedding_similarities[i] + 0.3 * keyword_score
-        combined_scores.append(combined_score)
+        print(f"Successfully computed embeddings for {len(samples_to_process)} samples")
+    else:
+        print("No samples with text content found")
     
-    combined_scores = np.array(combined_scores)
-    
-    top_indices = np.argsort(combined_scores)[::-1][:top_k]
-    top_similarities = combined_scores[top_indices]
-    valid_indices = top_indices[top_similarities >= threshold]
-    valid_ids = [sample_ids[i] for i in valid_indices]
-    valid_similarities = top_similarities[top_similarities >= threshold]
-    
-    view = dataset.select(valid_ids)
-    
-    similarity_field = f"similarity_{'_'.join(fields)}"
-    if similarity_field not in dataset.get_field_schema(flat=True):
-        dataset.add_sample_field(similarity_field, fo.FloatField)
-    
-    for sample_id, similarity in zip(valid_ids, valid_similarities):
-        sample = dataset[sample_id]
-        sample[similarity_field] = float(similarity)
-        sample.save()
-    
-    return view
+    return embedding_field_name
 
 
-class TextSemanticSearch(foo.Operator):
+def compute_similarity(dataset, embedding_field_name, fields, model_name):
+    """Compute similarity using FiftyOne brain."""
+    clean_fields = []
+    for field in fields:
+        clean_field = field.replace('.', '_').replace('/', '_').replace('-', '_')
+        clean_fields.append(clean_field)
+    
+    fields_suffix = '_'.join(clean_fields)
+    model_suffix = model_name.replace('-', '_').replace('/', '_')
+    brain_key = f"similarity_{fields_suffix}_{model_suffix}"
+    
+    fiftyone_model_name = get_fiftyone_model_name(model_name)
+    
+    if brain_key in dataset.list_brain_runs():
+        print(f"Using existing similarity brain key: {brain_key}")
+        return brain_key
+    
+    print(f"Computing similarity with brain key: {brain_key}")
+    fob.compute_similarity(
+        dataset,
+        embeddings=embedding_field_name,
+        brain_key=brain_key,
+        model=fiftyone_model_name
+    )
+    print(f"Similarity computation completed with brain key: {brain_key}")
+    return brain_key
+
+
+class ComputeTextEmbeddings(foo.Operator):
     @property
     def config(self):
         _config = foo.OperatorConfig(
-            name="text_semantic_search",
-            label="Text Semantic Search: Find samples by text meaning",
+            name="compute_text_embeddings",
+            label="Compute Text Embeddings: Generate embeddings for text fields",
             dynamic=True,
         )
         _config.icon = "/assets/icon_white.svg"
@@ -224,7 +155,7 @@ class TextSemanticSearch(foo.Operator):
         return types.Placement(
             types.Places.SAMPLES_GRID_ACTIONS,
             types.Button(
-                label="Text Semantic Search",
+                label="Compute Text Embeddings",
                 icon="/assets/icon_white.svg",
                 dark_icon="/assets/icon.svg",
                 light_icon="/assets/icon_white.svg",
@@ -235,21 +166,13 @@ class TextSemanticSearch(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
         form_view = types.View(
-            label="Text Semantic Search", description="Find samples by text meaning"
+            label="Compute Text Embeddings", description="Generate embeddings for selected text fields"
         )
 
         text_fields = get_text_fields(ctx.dataset)
+        default_fields = text_fields[:2] if len(text_fields) >= 2 else text_fields
 
-        if not TEAMS_DEPLOYMENT:
-            cache = get_cache()
-            if "fields" in cache:
-                default_fields = cache["fields"]
-            else:
-                default_fields = text_fields[:2] if len(text_fields) >= 2 else text_fields
-        else:
-            default_fields = text_fields[:2] if len(text_fields) >= 2 else text_fields
-
-        field_dropdown = types.Dropdown(label="Fields to search within", multiple=True)
+        field_dropdown = types.Dropdown(label="Text Fields to Embed", multiple=True)
         for tf in text_fields:
             field_dropdown.add_choice(tf, label=tf)
 
@@ -260,23 +183,6 @@ class TextSemanticSearch(foo.Operator):
             view=field_dropdown,
         )
 
-        inputs.float(
-            "similarity_threshold",
-            label="Similarity Threshold",
-            default=0.3,
-            min=0.0,
-            max=1.0,
-            description="Minimum similarity score (0.0-1.0). Higher values = more strict matching. Results will include similarity scores for filtering."
-        )
-
-        inputs.int(
-            "top_k",
-            label="Max Results",
-            default=100,
-            min=1,
-            max=1000,
-        )
-
         inputs.int(
             "batch_size",
             label="Batch Size",
@@ -285,42 +191,61 @@ class TextSemanticSearch(foo.Operator):
             max=128,
         )
 
-        new_default_fields = ctx.params.get("search_fields", default_fields)
+        inputs.int(
+            "frame_skip",
+            label="Frame Skip",
+            default=1,
+            min=1,
+            max=100,
+            description="Process every Nth frame (1=all frames, 2=every other frame, etc.)"
+        )
 
-        if not TEAMS_DEPLOYMENT:
-            get_cache()["fields"] = new_default_fields
+        available_models = ['clip-ViT-B-32']
+        default_model = 'clip-ViT-B-32'
+        
+        model_dropdown = types.Dropdown(label="Embedding Model", default=default_model)
+        for model in available_models:
+            model_dropdown.add_choice(model, label=model)
+        
+        inputs.enum(
+            "model_name",
+            available_models,
+            default=default_model,
+            view=model_dropdown,
+        )
 
-        inputs.str("query", label="Search Query", required=True)
+        inputs.str(
+            "embedding_field_name",
+            label="Embedding Field Name",
+            default="embeddings",
+            description="Name for the embedding field (will be auto-generated if empty)"
+        )
+
         return types.Property(inputs, view=form_view)
 
     def execute(self, ctx):
-        query = ctx.params["query"]
         fields = ctx.params["search_fields"]
-        threshold = ctx.params["similarity_threshold"]
-        top_k = ctx.params["top_k"]
+        model_name = ctx.params["model_name"]
         batch_size = ctx.params["batch_size"]
-        view = semantic_search(ctx.dataset, fields, query, threshold, top_k, batch_size)
+        frame_skip = ctx.params["frame_skip"]
+        embedding_field_name = ctx.params.get("embedding_field_name", "")
         
-        similarity_field = f"similarity_{'_'.join(fields)}"
-        if similarity_field in ctx.dataset.get_field_schema(flat=True):
-            view = view.sort_by(similarity_field, reverse=True)
+        if not embedding_field_name.strip():
+            embedding_field_name = None
+        
+        embedding_field = compute_embeddings(ctx.dataset, fields, model_name, batch_size, embedding_field_name, frame_skip)
+        print(f"Embeddings computed and stored in field: {embedding_field}")
+        
+        brain_key = compute_similarity(ctx.dataset, embedding_field, fields, model_name)
+        print(f"Similarity computation completed with brain key: {brain_key}")
+        
+        view = ctx.dataset.exists(embedding_field)
         
         ctx.ops.set_view(view=view)
         ctx.ops.reload_dataset()
         
-        num_results = len(view)
-        if num_results > 0:
-            scores = [sample[similarity_field] for sample in view if similarity_field in sample and sample[similarity_field] is not None]
-            if scores:
-                max_score = max(scores)
-                min_score = min(scores)
-                avg_score = sum(scores) / len(scores)
-                print(f"Found {num_results} results with similarity scores ranging from {min_score:.3f} to {max_score:.3f} (avg: {avg_score:.3f})")
-            else:
-                print(f"Found {num_results} results")
-        else:
-            print(f"No results found above threshold {threshold}. Try lowering the threshold or using different search terms.")
+        print(f"Successfully processed {len(view)} samples")
 
 
 def register(plugin):
-    plugin.register(TextSemanticSearch)
+    plugin.register(ComputeTextEmbeddings)
